@@ -1,0 +1,251 @@
+from m5.params import *
+from m5.objects import *
+
+from common import FileSystemConfig
+import yaml
+import json
+
+from .BaseTopology import SimpleTopology
+
+from omelet.nox.hierarchy.intra_chiplet import build_intra_chiplet
+from omelet.nox.hierarchy.mesh_horiz_inter_chiplet import build_horizontal_inter_chiplet
+from omelet.nox.hierarchy.connect_noi_noc_meshmesh import connect_noi_noc
+
+from omelet.nox.builders import *
+
+class mesh_nox(SimpleTopology):
+    description = "mesh_nox"
+    def __init__(self, ctrls): 
+        self.nodes = ctrls
+    
+    def makeTopology(self, opts, net, IntLink, ExtLink, Router):
+        import time
+        from pathlib import Path
+        init_started = time.monotonic()
+        def progress(stage):
+            print(f"OMELET_INIT {stage}; wall_s={time.monotonic() - init_started:.1f}", flush=True)
+        def read_config(label, filename, loader):
+            path = Path(filename)
+            progress(f"reading {label}: path={path.resolve()} bytes={path.stat().st_size}")
+            started = time.monotonic()
+            with path.open(encoding="utf-8") as stream:
+                config = loader(stream)
+            if not isinstance(config, dict):
+                raise ValueError(f"{label} must contain a mapping: {path}")
+            progress(f"read {label} completed; read_s={time.monotonic() - started:.1f}")
+            return config
+        progress("loading network configuration and technology tables")
+
+        self.sys_cfg = read_config("system YAML", opts.sys_config, yaml.safe_load)
+        if getattr(opts, "net_config", None):
+            self.sys_cfg.update(read_config("network YAML", opts.net_config, yaml.safe_load))
+        progress("creating link technology library")
+        self.link_lib = Linklib(opts.material, len(self.sys_cfg["noc_routers_per_chiplet"]))
+        progress("link technology library created")
+        self.noi_cfg = read_config("NoI YAML", opts.noi_config, yaml.safe_load)
+        self.plc_cfg = read_config("placement YAML", opts.plc_config, yaml.safe_load)
+        self.nonuniform_grid = None
+        if getattr(opts, "nonuniform_grid_config", None):
+            self.nonuniform_grid = read_config("nonuniform grid JSON", opts.nonuniform_grid_config, json.load)
+            from omelet.inputs.coordinates import normalize_grid
+            normalize_grid(self.nonuniform_grid)
+        self.noc_cfg = []
+           
+        nodes = self.nodes
+        num_chiplets = self.link_lib.num_chiplets
+        mem_ctrls = 0
+        total_cpus = opts.num_cpus + mem_ctrls
+
+        noc_one = read_config("NoC YAML", opts.noc_config, yaml.safe_load)
+        progress(f"preparing per-chiplet NoC configuration; chiplets={num_chiplets}")
+        for chiplet_i in range(num_chiplets):
+            cfg = dict(noc_one)
+            if chiplet_i % 100 == 0:
+                progress(f"per-chiplet NoC configuration {chiplet_i}/{num_chiplets}")
+            if self.nonuniform_grid is not None:
+                shape = self.nonuniform_grid["chiplets"][str(chiplet_i)]["grid"]
+                cfg["mesh_rows"] = int(shape[1])
+            self.noc_cfg.append(cfg)
+        progress(f"per-chiplet NoC configuration {num_chiplets}/{num_chiplets} completed")
+
+        noc_routers_per_chiplet_list = self.sys_cfg["noc_routers_per_chiplet"]
+        assert len(noc_routers_per_chiplet_list) == num_chiplets
+
+        link_cnt = 0
+        int_links = []
+        ext_links = []
+
+        progress(f"creating NoC routers and endpoint links; chiplets={num_chiplets}")
+        noc_routers = []
+        router_id = 0
+        router_map = {}
+        for chiplet_i in range(num_chiplets):
+            role = f"chiplet{chiplet_i}"
+            router_map[role] = []
+            if chiplet_i % 100 == 0:
+                progress(f"NoC routers and endpoint links {chiplet_i}/{num_chiplets}")
+            num_routers = noc_routers_per_chiplet_list[role]
+            # All routers and endpoint links in one chiplet use the same
+            # configured clock.  Reuse one domain instead of constructing a
+            # duplicate clock/voltage SimObject for every port.
+            chiplet_clk_domain = SrcClockDomain(
+                clock=self.sys_cfg["chiplet_clock"],
+                voltage_domain=VoltageDomain(
+                    voltage=self.sys_cfg["sys_voltage"]
+                ),
+            )
+
+            for _ in range(num_routers):
+                chiplet_rtr_lat = self.sys_cfg["router_latency"]["chiplets"][role]
+                curr_router_id = router_id
+                noc_routers.append(Router(router_id=curr_router_id,
+                                          latency=chiplet_rtr_lat, 
+                                          width=self.sys_cfg["onchip_width"], 
+                                          role=role))
+
+
+                router_map[role].append(curr_router_id)
+                noc_routers[curr_router_id].clk_domain = chiplet_clk_domain
+                ext_links.append(ExtLink(link_id=link_cnt,
+                                        ext_node=nodes[curr_router_id],
+                                        int_node=noc_routers[curr_router_id],
+                                        width=self.sys_cfg["onchip_width"],
+                                        clk_domain=chiplet_clk_domain,
+                                        latency=self.sys_cfg["ext_latency"]))
+                vcs_count = opts.vcs_per_vnet if hasattr(opts, 'vcs_per_vnet') else self.sys_cfg["top_vc"]
+                noc_routers[curr_router_id].vcs_per_vnet = vcs_count
+                link_cnt += 1
+
+                ext_links.append(ExtLink(link_id=link_cnt,
+                                        ext_node=nodes[total_cpus + curr_router_id],
+                                        int_node=noc_routers[curr_router_id],
+                                        width=self.sys_cfg["onchip_width"],
+                                        clk_domain=chiplet_clk_domain,
+                                        latency=self.sys_cfg["ext_latency"]))
+                link_cnt += 1
+                router_id += 1
+
+        progress(f"NoC routers and endpoint links {num_chiplets}/{num_chiplets} completed")
+        noi_routers = []
+        router_map["interposer"] = []
+        noi_rtr_width = noi_router_width(opts, self.link_lib, self.sys_cfg, self.plc_cfg)
+        noi_clk_domain = SrcClockDomain(clock=self.sys_cfg["noi_clock"],
+            voltage_domain=VoltageDomain(voltage=self.sys_cfg["sys_voltage"]))
+
+        for i in range(self.noi_cfg["num_routers"]):
+            if i % 100 == 0:
+                progress(f"NoI routers {i}/{self.noi_cfg['num_routers']}")
+            role = "interposer"
+            noi_rtr_lat = self.sys_cfg["router_latency"]["interposer"]
+            noi_routers.append(Router(router_id=router_id, 
+                                      latency=noi_rtr_lat,
+                                      clk_domain=noi_clk_domain,
+                                      width=noi_rtr_width, 
+                                      role=role))
+            
+
+            router_map[role].append(router_id)
+            router_id += 1
+
+        progress(f"NoI routers {len(noi_routers)}/{self.noi_cfg['num_routers']} completed")
+        net.routers = noc_routers + noi_routers
+        progress(f"routers created count={len(net.routers)}; creating intra-chiplet links")
+
+        for chiplet_i in range(num_chiplets):
+            role = f"chiplet{chiplet_i}"
+            rows = self.noc_cfg[chiplet_i]["mesh_rows"]
+            cols = noc_routers_per_chiplet_list[role] // rows
+            if chiplet_i % 100 == 0:
+                progress(f"intra-chiplet links {chiplet_i}/{num_chiplets}")
+            intra_int, num_new_links = build_intra_chiplet(
+                opts, self.link_lib, self.noc_cfg[chiplet_i], self.sys_cfg, self.plc_cfg, 
+                net, net.routers, IntLink, router_map[role][0], link_cnt,
+                rows, cols
+            )
+            int_links.extend(intra_int)
+            link_cnt += num_new_links
+
+
+        progress(f"intra-chiplet links {num_chiplets}/{num_chiplets} completed")
+        if self.nonuniform_grid is None:
+            h_int, num_new_links = build_horizontal_inter_chiplet(
+                opts, self.link_lib, self.noi_cfg, self.sys_cfg, self.plc_cfg,
+                net, net.routers, IntLink, router_map["interposer"][0], link_cnt
+            )
+            int_links.extend(h_int)
+            link_cnt += num_new_links
+
+
+        progress("creating NoC-NoI boundary links")
+        noc_noi_connect_int, num_new_links = connect_noi_noc(
+            opts, self.link_lib, self.noc_cfg, self.noi_cfg, self.sys_cfg, self.plc_cfg, 
+            net, net.routers, IntLink, nodes, link_cnt, noc_routers_per_chiplet_list, router_map,
+            self.nonuniform_grid, progress=progress
+        )
+        int_links.extend(noc_noi_connect_int)
+        link_cnt += num_new_links
+
+        if self.nonuniform_grid is not None and self.nonuniform_grid["grid_shape"][2] > 1:
+            grid = self.nonuniform_grid
+            from omelet.nox.vertical import resolve_vertical_method, vertical_ports, vertical_port_width
+            requested = self.sys_cfg.get('vertical_interconnect_method',0) if opts.vertical_interconnect_method is None else opts.vertical_interconnect_method
+            method = resolve_vertical_method(grid, requested)
+            progress(f'vertical-interconnect-method={method}')
+            plane = grid["grid_shape"][0] * grid["grid_shape"][1]
+            pairs = len(grid["chiplets"]) - plane
+            progress(f"creating NoL vertical links 0/{pairs} chiplet_pairs")
+            for upper in range(plane, len(grid["chiplets"])):
+                lower = upper - plane
+                ports = vertical_ports(grid['chiplets'][str(lower)]['grid'],grid['chiplets'][str(upper)]['grid'],method)
+                via_width = vertical_port_width(self.sys_cfg,self.plc_cfg,f'chiplet{lower}',f'chiplet{upper}',len(ports),opts.c2c_bonding) if method == 1 else None
+                for lo, hi in ports:
+                    a = router_map[f"chiplet{lower}"][lo]
+                    b = router_map[f"chiplet{upper}"][hi]
+                    for src, dst, outport, inport in ((a, b, "NoLUp", "NoLDown"), (b, a, "NoLDown", "NoLUp")):
+                        int_links.append(make_link(opts=opts, tech=self.link_lib,
+                            sys_cfg=self.sys_cfg, plc_cfg=self.plc_cfg, nox_cfg=self.noc_cfg[upper],
+                            IntLinks=IntLink, lid=link_cnt, src_router=net.routers[src],
+                            dst_router=net.routers[dst], src_outport=outport, dst_inport=inport, length=None, via_width=via_width))
+                        link_cnt += 1
+                if (upper - plane + 1) % 100 == 0 or upper == len(grid["chiplets"]) - 1:
+                    progress(f"creating NoL vertical links {upper-plane+1}/{pairs} chiplet_pairs")
+
+
+
+        progress(f"validating endpoint links; internal={len(int_links)} external={len(ext_links)}")
+        sanity_check_controller_links(nodes, net.routers, ext_links)
+        progress("network topology complete")
+        net.int_links = int_links
+        net.ext_links = ext_links
+
+
+        if buildEnv['PROTOCOL'] != 'Garnet_standalone':
+            for i in range(opts.num_cpus):
+                size_per_cpu = int(MemorySize(opts.mem_size)) // opts.num_cpus
+                FileSystemConfig.register_node(
+                        [i],
+                        MemorySize(f"{size_per_cpu}B"),
+                        i)
+
+    def registerTopology(self, options):
+        for i in range(options.num_cpus):
+            FileSystemConfig.register_node([i],
+                    MemorySize(options.mem_size) // options.num_cpus, i)
+
+
+def sanity_check_controller_links(nodes, routers, ext_links):
+    from collections import defaultdict
+
+    ctrl2router = {}
+    for el in ext_links:
+        ctrl2router[el.ext_node] = el.int_node
+
+    missing   = [c for c in nodes if c not in ctrl2router]
+    dupes     = len(ctrl2router) != len(ext_links)
+    bad_count = bool(missing) or dupes
+
+    if missing:
+        print("!! WARNING: These controllers are NOT wired:", missing)
+    if dupes:
+        print("!! WARNING: At least one controller got wired more than once.")
+    assert not bad_count, "Topology wiring error — see warnings above."
